@@ -8,7 +8,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from qodercn_adapter import ModelEffortCatalog, QoderCnSource, speed_for_effort
+from qodercn_adapter import AppLogEffort, ModelEffortCatalog, QoderCnSource, speed_for_effort
 from source_config import CHOICES, NAMES, enabled_sources, selection_for
 
 
@@ -26,10 +26,10 @@ def assistant(*blocks, stop=None, message_id='as-1', model='magpie/group/safely-
                                    'stop_reason': stop, 'content': content}})
 
 
-def user_tool_result():
+def user_tool_result(tool_use_id='call-Bash'):
     return json.dumps({'type': 'user', 'isSidechain': False,
                        'message': {'role': 'user', 'content': [
-                           {'type': 'tool_result', 'tool_use_id': 'call-Bash', 'content': 'ok'}]}})
+                           {'type': 'tool_result', 'tool_use_id': tool_use_id, 'content': 'ok'}]}})
 
 
 def user_prompt(text='do the task'):
@@ -141,11 +141,29 @@ class QoderCnSourceTests(unittest.TestCase):
     def test_an_answered_question_resumes_work(self):
         path = self.write([user_prompt(), assistant('AskUserQuestion', stop='tool_use')])
         self.poll()
-        self.append(path, [user_tool_result()])
+        self.append(path, [user_tool_result('call-AskUserQuestion')])
         result = self.poll()
         self.assertEqual(result['motor'], 'RUN MEDIUM')
         self.assertFalse(result['light'])
         self.assertEqual(result['working_threads'], ['s1'])
+
+    def test_an_unrelated_tool_result_keeps_the_question_pending(self):
+        path = self.write([user_prompt(),
+                           assistant('AskUserQuestion', 'Bash', stop='tool_use')])
+        self.assertEqual(self.poll()['waiting_threads'], ['s1'])
+        self.append(path, [user_tool_result('call-Bash')])
+        result = self.poll()
+        self.assertEqual(result['waiting_threads'], ['s1'])
+        self.assertTrue(result['light'])
+        self.assertEqual(result['motor'], 'STOP')
+
+    def test_the_matching_result_clears_the_pending_question(self):
+        path = self.write([user_prompt(),
+                           assistant('AskUserQuestion', 'Bash', stop='tool_use')])
+        self.poll()
+        self.append(path, [user_tool_result('call-Bash'),
+                           user_tool_result('call-AskUserQuestion')])
+        self.assertEqual(self.poll()['working_threads'], ['s1'])
 
     def test_a_parallel_response_with_a_question_still_waits(self):
         self.write([user_prompt(),
@@ -229,15 +247,32 @@ class QoderCnSourceTests(unittest.TestCase):
         self.write([user_prompt(), assistant('Bash', stop='tool_use')])
         self.assertEqual(self.poll()['motor'], 'RUN ULTRA')
 
+    def test_an_effort_seen_before_the_transcript_is_kept(self):
+        # The app log can be read before the session transcript appears.
+        self.write_log([policy_line('s1', 'max')])
+        source = QoderCnSource(self.root, self.app_data)
+        self.assertTrue(source.poll(self.now)['healthy'])
+        self.write([user_prompt(), assistant('Bash', stop='tool_use')])
+        self.assertEqual(source.poll(time.time() + 1)['motor'], 'RUN ULTRA')
+
+    def test_an_unmatched_effort_is_dropped_after_retention(self):
+        self.write_log([policy_line('s1', 'max')])
+        source = QoderCnSource(self.root, self.app_data)
+        source.poll(self.now)
+        self.assertIn('s1', source.effort_log.efforts)
+        source.poll(self.now + AppLogEffort.RETENTION + 1)
+        self.assertEqual(source.effort_log.efforts, {})
+
     def test_policy_lines_from_other_sessions_do_not_leak(self):
         self.write([user_prompt(), assistant('Bash', stop='tool_use')])
         self.write_log([policy_line('other-session', 'low')])
         self.assertEqual(self.poll()['motor'], 'RUN MEDIUM')
 
     def test_the_app_log_is_read_from_the_newest_run_only(self):
-        (self.app_data / 'logs' / 'old-run').mkdir(parents=True)
-        (self.app_data / 'logs' / 'old-run' / 'main.log').write_text(
-            policy_line('s1', 'low') + '\n', encoding='utf-8')
+        old = self.app_data / 'logs' / 'old-run' / 'main.log'
+        old.parent.mkdir(parents=True)
+        old.write_text(policy_line('s1', 'low') + '\n', encoding='utf-8')
+        os.utime(old, (self.now - 60, self.now - 60))
         self.write([user_prompt(), assistant('Bash', stop='tool_use')])
         self.write_log([policy_line('s1', 'max')], run='new-run')
         self.assertEqual(self.poll()['motor'], 'RUN ULTRA')

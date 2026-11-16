@@ -143,8 +143,7 @@ class SessionState:
     model: str | None = None
     effort: str | None = None
     questions: int = 0
-    message_id: str | None = None
-    pending_tools: list = field(default_factory=list)
+    question_ids: set = field(default_factory=set)
 
     def record(self, record):
         kind = record.get('type')
@@ -164,22 +163,21 @@ class SessionState:
         if kind == 'assistant':
             if isinstance(message.get('model'), str):
                 self.model = message['model']
-            message_id = message.get('id')
-            if message_id != self.message_id:
-                self.message_id = message_id
-                self.pending_tools = []
             for block in blocks:
-                if isinstance(block, dict) and block.get('type') == 'tool_use':
-                    name = block.get('name')
-                    if isinstance(name, str):
-                        self.pending_tools.append(name)
+                if (isinstance(block, dict) and block.get('type') == 'tool_use'
+                        and block.get('name') in QUESTION_TOOLS
+                        and isinstance(block.get('id'), str)):
+                    self.question_ids.add(block['id'])
             stop = message.get('stop_reason')
             if stop is None:
                 self.phase = 'working'
             elif stop == 'tool_use':
-                if any(name in QUESTION_TOOLS for name in self.pending_tools):
+                # A question asked alongside other tools stays pending until its
+                # own tool-call id comes back, so a sibling tool result cannot
+                # clear it.
+                if self.question_ids:
                     self.phase = 'waiting'
-                    self.questions = 1
+                    self.questions = len(self.question_ids)
                 else:
                     self.phase = 'working'
                     self.questions = 0
@@ -187,15 +185,32 @@ class SessionState:
                 # end_turn/stop_sequence/max_tokens and unknown terminal values.
                 self.phase = 'idle'
                 self.questions = 0
+                self.question_ids.clear()
         elif kind == 'user':
-            self.message_id = None
-            self.pending_tools = []
             interrupted = any(isinstance(block, dict) and block.get('type') == 'text'
                               and isinstance(block.get('text'), str)
                               and block['text'].startswith(INTERRUPTED_PREFIX)
                               for block in blocks)
-            self.phase = 'idle' if interrupted else 'working'
-            self.questions = 0
+            result_ids = {block.get('tool_use_id') for block in blocks
+                          if isinstance(block, dict) and block.get('type') == 'tool_result'
+                          and isinstance(block.get('tool_use_id'), str)}
+            if interrupted:
+                self.question_ids.clear()
+                self.phase = 'idle'
+                self.questions = 0
+            elif result_ids:
+                # Only a result carrying the question's tool-call id answers it.
+                self.question_ids -= result_ids
+                if self.question_ids:
+                    self.phase = 'waiting'
+                    self.questions = len(self.question_ids)
+                else:
+                    self.phase = 'working'
+                    self.questions = 0
+            else:
+                self.question_ids.clear()
+                self.phase = 'working'
+                self.questions = 0
 
 
 class AppLogEffort:
@@ -208,11 +223,13 @@ class AppLogEffort:
     """
     MAX_SCAN = 4 * 1024 * 1024
     MAX_LINE = 256 * 1024
+    RETENTION = 600.0
 
     def __init__(self, app_data=None):
         self.app_data = Path(app_data) if app_data else None
         self.cursors = {}
         self.efforts = {}
+        self.seen = {}
 
     def log_root(self):
         # An explicit app-data directory is authoritative, which keeps tests
@@ -249,10 +266,10 @@ class AppLogEffort:
         keep = set()
         for _, path in logs[-6:]:
             keep.add(path)
-            self._tail(path)
+            self._tail(path, now)
         self.cursors = {k: v for k, v in self.cursors.items() if k in keep}
 
-    def _tail(self, path):
+    def _tail(self, path, now):
         try:
             with open_read_shared(path) as file:
                 stat = os.fstat(file.fileno())
@@ -276,13 +293,13 @@ class AppLogEffort:
                         dropping = not part.endswith(b'\n')
                         pending = b''
                     elif pending.endswith(b'\n'):
-                        self._line(pending)
+                        self._line(pending, now)
                         pending = b''
                 self.cursors[path] = (identity, offset, pending, dropping)
         except OSError:
             self.cursors.pop(path, None)
 
-    def _line(self, line):
+    def _line(self, line, now):
         if b'ChatSession model policy' not in line or b'frozenReasoningEffort' not in line:
             return
         start = line.find(b'{')
@@ -296,6 +313,14 @@ class AppLogEffort:
         effort = body.get('frozenReasoningEffort')
         if isinstance(session_id, str) and isinstance(effort, str):
             self.efforts[session_id] = effort
+            self.seen[session_id] = now
+
+    def prune(self, present_ids, now):
+        # Keep a session's effort briefly even before its transcript appears, so
+        # a log line read first is not lost when the transcript shows up later.
+        self.efforts = {key: value for key, value in self.efforts.items()
+                        if key in present_ids or now - self.seen.get(key, now) <= self.RETENTION}
+        self.seen = {key: value for key, value in self.seen.items() if key in self.efforts}
 
 
 class TranscriptFile:
@@ -467,9 +492,8 @@ class QoderCnSource:
             elif state.phase == 'waiting':
                 waiting.append(session_id)
                 pending += state.questions
-        self.effort_log.efforts = {
-            key: value for key, value in self.effort_log.efforts.items()
-            if any(entry.state.session_id == key for entry in self.sessions.values())}
+        self.effort_log.prune(
+            {entry.state.session_id for entry in self.sessions.values()}, now)
 
         motor = 'STOP'
         if speeds:
